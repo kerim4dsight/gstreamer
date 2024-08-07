@@ -20,6 +20,8 @@ if not srt_dep.found() and srt_option.enabled()
   error('srt plugin enabled, but srt library not found')
 endif
 
+srt_exp = cc.find_library('srtexp', required : false)
+
 if srt_dep.found()
   gstsrt_enums = gnome.mkenums_simple('gstsrt-enumtypes',
     sources: ['gstsrt-enums.h'],
@@ -31,7 +33,7 @@ if srt_dep.found()
     c_args : gst_plugins_bad_args,
     link_args : noseh_link_args,
     include_directories : [configinc, libsinc],
-    dependencies : [gstbase_dep, gio_dep, srt_dep],
+    dependencies : [gstbase_dep, gio_dep, srt_dep, srt_exp],
     install : true,
     install_dir : plugins_install_dir,
   )

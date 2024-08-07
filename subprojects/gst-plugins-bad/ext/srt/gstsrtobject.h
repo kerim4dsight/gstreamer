@@ -74,6 +74,11 @@ struct _GstSRTObject
   gboolean                     authentication;
 
   guint64                      bytes;
+
+  /* Custom Implementation */
+  guint                       metric_exporter_port; // 0 means disabled
+  gint                        metric_exporter_id; // active metric exporter id
+  gboolean                    metric_exporter_enable;
 };
 
 GstSRTObject   *gst_srt_object_new              (GstElement *element);

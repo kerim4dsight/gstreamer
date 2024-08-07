@@ -34,6 +34,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include <srtexp/srtexp_api_c_wrapper.h>
+
 GST_DEBUG_CATEGORY_EXTERN (gst_debug_srtobject);
 #define GST_CAT_DEFAULT gst_debug_srtobject
 
@@ -81,6 +83,8 @@ enum
   PROP_STREAMID,
   PROP_AUTHENTICATION,
   PROP_AUTO_RECONNECT,
+  PROP_METRIC_EXPORTER_PORT,
+  PROP_METRIC_EXPORTER_ENABLE,
   PROP_LAST
 };
 
@@ -370,6 +374,9 @@ gst_srt_object_new (GstElement * element)
   srtobject->sent_headers = FALSE;
   srtobject->wait_for_connection = GST_SRT_DEFAULT_WAIT_FOR_CONNECTION;
   srtobject->auto_reconnect = GST_SRT_DEFAULT_AUTO_RECONNECT;
+  srtobject->metric_exporter_port = 0;
+  srtobject->metric_exporter_id = -1;
+  srtobject->metric_exporter_enable = FALSE;
 
   fd = g_cancellable_get_fd (srtobject->cancellable);
   if (fd >= 0)
@@ -449,6 +456,12 @@ gst_srt_object_set_property_helper (GstSRTObject * srtobject,
       srtobject->authentication = g_value_get_boolean (value);
     case PROP_AUTO_RECONNECT:
       srtobject->auto_reconnect = g_value_get_boolean (value);
+      break;
+    case PROP_METRIC_EXPORTER_PORT:
+      srtobject->metric_exporter_port = g_value_get_uint (value);
+      break;
+    case PROP_METRIC_EXPORTER_ENABLE:
+      srtobject->metric_exporter_enable = g_value_get_boolean (value);
       break;
     default:
       goto err;
@@ -559,6 +572,16 @@ gst_srt_object_get_property_helper (GstSRTObject * srtobject,
     case PROP_AUTO_RECONNECT:
       GST_OBJECT_LOCK (srtobject->element);
       g_value_set_boolean (value, srtobject->auto_reconnect);
+      GST_OBJECT_UNLOCK (srtobject->element);
+      break;
+    case PROP_METRIC_EXPORTER_PORT:
+      GST_OBJECT_LOCK (srtobject->element);
+      g_value_set_uint (value, srtobject->metric_exporter_port);
+      GST_OBJECT_UNLOCK (srtobject->element);
+      break;
+    case PROP_METRIC_EXPORTER_ENABLE:
+      GST_OBJECT_LOCK (srtobject->element);
+      g_value_set_boolean (value, srtobject->metric_exporter_enable);
       GST_OBJECT_UNLOCK (srtobject->element);
       break;
     default:
@@ -737,6 +760,34 @@ gst_srt_object_install_properties_helper (GObjectClass * gobject_class)
           "Automatically reconnect when connection fails",
           GST_SRT_DEFAULT_AUTO_RECONNECT,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstSRTSrc:metric-exporter-port:
+   *
+   * The metric exporter port to use for the metric exporter.
+   * Even if the default value indicates infinite waiting
+   */
+  g_object_class_install_property (gobject_class, PROP_METRIC_EXPORTER_PORT,
+      g_param_spec_uint ("metric-exporter-port", "Metric exporter port",
+          "Enable/Disable and manage port for metric exporter", 0,
+          G_MAXUINT16, 0,
+          G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY |
+          G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstSRTSink:metric-exporter-enable:
+   *
+   * Boolean to enable metric exporter.  If TRUE,
+   * the metric exporter is enabled.
+   *
+   * Since: 1.24.5
+   *
+   */
+  g_object_class_install_property (gobject_class, PROP_METRIC_EXPORTER_ENABLE,
+      g_param_spec_boolean ("metric-exporter-enable",
+          "Metric Exporter",
+          "Enable metric exporter",
+          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 }
 
 static void
@@ -1029,6 +1080,15 @@ thread_func (gpointer data)
         g_socket_address_new_from_native (&caller_sa.sa, caller_sa_len);
     caller->poll_id = srt_epoll_create ();
     caller->sock = caller_sock;
+
+    if (srtobject->metric_exporter_enable
+        && srtobject->metric_exporter_id != -1) {
+      srtexp_c_srt_socket_register (&caller->sock, 1,
+          srtobject->metric_exporter_id);
+      GST_WARNING_OBJECT (srtobject->element,
+          "Metric Exporter enabled, Listener mode using starting metric collector with '%d'",
+          srtobject->metric_exporter_id);
+    }
 
     fd = g_cancellable_get_fd (srtobject->cancellable);
     if (fd >= 0)
@@ -1405,6 +1465,46 @@ gst_srt_object_open_internal (GstSRTObject * srtobject, GError ** error)
         gst_srt_object_connect (srtobject, connection_mode, sa, sa_len, error);
   }
 
+  if (srtobject->metric_exporter_enable) {      // Add enable prometheus
+    if (srtobject->sock == SRT_INVALID_SOCK) {
+      GST_WARNING_OBJECT (srtobject->element, "Failed to open SRT socket");
+      goto out;
+    }
+    const gchar *metric_exporter_name = NULL;
+    guint metric_exporter_port = 0;
+
+    GST_OBJECT_LOCK (srtobject->element);
+    metric_exporter_name =
+        gst_structure_get_string (srtobject->parameters, "name");
+    metric_exporter_port = srtobject->metric_exporter_port;
+    GST_OBJECT_UNLOCK (srtobject->element);
+
+    if (metric_exporter_name == NULL) { // TODO: check this identification
+      if (connection_mode == GST_SRT_CONNECTION_MODE_LISTENER) {
+        metric_exporter_name = "srt_exporter_listener";
+      } else {
+        metric_exporter_name = "srt_exporter";
+      }
+    }
+
+    if (metric_exporter_port == 0)
+      metric_exporter_port = port;
+
+    GST_INFO_OBJECT (srtobject->element,
+        "Trying to open srt prometheus plugin with %s", metric_exporter_name);
+    srtexp_c_custom_init (metric_exporter_name, "0.0.0.0",
+        metric_exporter_port);
+    if (SRT_EXP_C_SUCCESS != srtexp_c_start (metric_exporter_name,
+            &srtobject->metric_exporter_id)) {
+      GST_WARNING_OBJECT (srtobject->element,
+          "Failed to open srt prometheus plugin");
+      goto out;
+    }
+
+    if (connection_mode != GST_SRT_CONNECTION_MODE_LISTENER)
+      srtexp_c_srt_socket_register (&srtobject->sock, 1,
+          srtobject->metric_exporter_id);
+  }
 out:
   g_clear_object (&socket_address);
 
