@@ -392,6 +392,11 @@ gst_srt_object_destroy (GstSRTObject * srtobject)
 {
   g_return_if_fail (srtobject != NULL);
 
+  if (srtobject->metric_exporter_enable && srtobject->metric_exporter_id != -1) {
+    srtexp_c_stop (NULL, srtobject->metric_exporter_id);
+    srtexp_c_deinit ();
+  }
+
   if (srtobject->sock != SRT_INVALID_SOCK) {
     srt_close (srtobject->sock);
   }
@@ -1474,8 +1479,7 @@ gst_srt_object_open_internal (GstSRTObject * srtobject, GError ** error)
     guint metric_exporter_port = 0;
 
     GST_OBJECT_LOCK (srtobject->element);
-    metric_exporter_name =
-        gst_structure_get_string (srtobject->parameters, "name");
+    metric_exporter_name = srtobject->element->object.name;
     metric_exporter_port = srtobject->metric_exporter_port;
     GST_OBJECT_UNLOCK (srtobject->element);
 
@@ -1498,8 +1502,12 @@ gst_srt_object_open_internal (GstSRTObject * srtobject, GError ** error)
             &srtobject->metric_exporter_id)) {
       GST_WARNING_OBJECT (srtobject->element,
           "Failed to open srt prometheus plugin");
+      srtexp_c_deinit ();
       goto out;
     }
+
+    srtexp_c_label_register ("application", metric_exporter_name, NULL,
+        srtobject->metric_exporter_id);
 
     if (connection_mode != GST_SRT_CONNECTION_MODE_LISTENER)
       srtexp_c_srt_socket_register (&srtobject->sock, 1,
